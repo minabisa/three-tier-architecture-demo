@@ -4,7 +4,7 @@ terraform {
   # Replace with your own state bucket (do not reuse gitops-platform-tfstate-<acct-id>,
   # keep this project's state isolated so the two clusters can be destroyed independently)
   backend "s3" {
-    bucket = "robot-shop-tfstate-<YOUR_AWS_ACCOUNT_ID>"
+    bucket = "robot-shop-tfstate-928535088615"
     key    = "robot-shop/eks/terraform.tfstate"
     region = "us-east-1"
   }

@@ -1,0 +1,150 @@
+name: CI/CD - Build, Scan, Push Microservices
+
+# Triggers on any push to main touching a service directory, or manually
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'cart/**'
+      - 'catalogue/**'
+      - 'dispatch/**'
+      - 'payment/**'
+      - 'ratings/**'
+      - 'shipping/**'
+      - 'user/**'
+      - 'web/**'
+      - 'load-gen/**'
+      - '.github/workflows/ci-cd.yml'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  # Detect which microservices actually changed so we don't rebuild all 12 on every commit
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            cart: 'cart/**'
+            catalogue: 'catalogue/**'
+            dispatch: 'dispatch/**'
+            payment: 'payment/**'
+            ratings: 'ratings/**'
+            shipping: 'shipping/**'
+            user: 'user/**'
+            web: 'web/**'
+            load-gen: 'load-gen/**'
+
+  build-scan-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tag
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/robot-shop-${{ matrix.service }}:${{ steps.vars.outputs.sha_short }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/robot-shop-${{ matrix.service }}:latest
+          load: true
+
+      # Fail-on-critical scanning — a deliberate step up from the warn-only Trivy
+      # gate used in gitops-platform, since this app is customer-facing (web/payment/user).
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/robot-shop-${{ matrix.service }}:${{ steps.vars.outputs.sha_short }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Push image (main branch only)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/robot-shop-${{ matrix.service }}:${{ steps.vars.outputs.sha_short }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/robot-shop-${{ matrix.service }}:latest
+
+  # Deploys straight to the dedicated robot-shop-eks cluster (provisioned separately
+  # via infra.yml / terraform). Assumes the cluster already exists.
+  deploy-to-eks:
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC auth to AWS, no long-lived keys stored in GitHub
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region us-east-1 --name robot-shop-eks
+
+      - name: Set image tag
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Helm upgrade/install
+        run: |
+          helm upgrade --install robot-shop ./K8s/helm \
+            --namespace robot-shop --create-namespace \
+            --set image.registry=ghcr.io \
+            --set image.namespace=${{ env.IMAGE_NAMESPACE }} \
+            --set image.tag=${{ steps.vars.outputs.sha_short }} \
+            --wait --timeout 5m
+
+      - name: Verify rollout
+        run: kubectl get pods -n robot-shop
