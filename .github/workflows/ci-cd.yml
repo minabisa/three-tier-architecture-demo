@@ -85,7 +85,7 @@ jobs:
       # Fail-on-critical scanning — a deliberate step up from the warn-only Trivy
       # gate used in gitops-platform, since this app is customer-facing (web/payment/user).
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/robot-shop-${{ matrix.service }}:${{ steps.vars.outputs.sha_short }}
           format: sarif
