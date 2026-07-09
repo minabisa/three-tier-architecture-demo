@@ -1,0 +1,44 @@
+name: Provision EKS Infra (Terraform)
+
+# Infra changes are deliberate, not tied to every app commit — manual trigger only
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'plan'
+        type: choice
+        options: [plan, apply, destroy]
+
+permissions:
+  contents: read
+  id-token: write # for OIDC auth to AWS
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - run: terraform init
+
+      - run: terraform plan -out=tfplan
+        if: github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
+
+      - run: terraform apply -auto-approve tfplan
+        if: github.event.inputs.action == 'apply'
+
+      - run: terraform destroy -auto-approve
+        if: github.event.inputs.action == 'destroy'
